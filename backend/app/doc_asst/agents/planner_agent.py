@@ -2,31 +2,36 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from langchain_openai import ChatOpenAI
+
 from ..core.agent import BaseAgent
-from ..core.contract import AgentContext
 
 
 class PlannerAgent(BaseAgent):
     """
     规划智能体：
     将用户需求拆解为可执行的研究与写作步骤。
+    通过 Function Calling 自主决定是否调用搜索/RAG/文件读取等工具获取背景信息。
     """
 
     DEFAULT_SYSTEM_PROMPT = (
-        "你是任务规划助手，只负责制定执行计划，不负责给出最终结论。"
-        "你必须严格遵守以下规则："
-        "1) 只能输出“计划”，禁止直接回答用户问题、禁止给出优缺点分析、禁止给出最终建议。"
-        "2) 输出必须包含以下五个部分，并使用这些中文标题："
-        "【任务目标】、【执行步骤】、【每步输入】、【每步输出】、【风险与注意事项】。"
-        "3) 【执行步骤】至少给出 3 步，且每步使用“步骤1/步骤2/步骤3”格式。"
-        "4) 如果用户请求的是分析类问题，也只输出如何分析的计划，不输出分析结果本身。"
-        "5) 保持简洁清晰，避免空话。"
-        "6) 最后必须追加一个 JSON 代码块，键为: task_goal, steps, step_inputs, step_outputs, risks。"
+        "你是任务规划助手，只输出计划，不输出结论。"
+        "规则："
+        "1) 禁止回答用户问题、禁止给出分析或建议。"
+        "2) 输出格式（严格按此，不要加其他标题）：\n"
+        "【目标】一句话描述任务目标。\n"
+        "【步骤】2~3步，每步一行，格式：步骤N: 简述。\n"
+        "【风险】1~2个关键风险，没有则写'无'。"
+        "3) 每步描述不超过30字。不要输出JSON。"
+        "\n\n工具调用策略："
+        "你只有 web_search 可用。仅在对话题完全不熟悉时调用一次。"
+        "调用后立即输出计划，不再调用工具。"
+        "如果已理解需求，直接输出计划。"
     )
 
     def __init__(
         self,
-        llm: Any,
+        llm: ChatOpenAI,
         tools: Optional[List[Any]] = None,
         temperature: float = 0.2,
         system_prompt: Optional[str] = None,
@@ -42,65 +47,18 @@ class PlannerAgent(BaseAgent):
     def run(
         self,
         user_input: str,
-        context: Optional[AgentContext] = None,
         memory: Optional[List[Dict[str, str]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        used_tools: List[str] = []
-        search_context = ""
-        memory_context = ""
-        if "web_search" in self._tool_map:
-            search_query = user_input
-            if context and context.metadata.get("search_query"):
-                search_query = str(context.metadata["search_query"])
-            search_result = self.get_tool("web_search").run(query=search_query, max_results=5)
-            used_tools.append("web_search")
-            if search_result.get("ok"):
-                payload = search_result.get("data", {})
-                provider = payload.get("provider", "unknown")
-                rows = payload.get("results", [])
-                lines = []
-                for idx, row in enumerate(rows, start=1):
-                    lines.append(
-                        f"{idx}. {row.get('title', '')}\nURL: {row.get('url', '')}\n摘要: {row.get('snippet', '')}"
-                    )
-                search_context = (
-                    f"已执行联网搜索，数据源: {provider}\n"
-                    f"搜索结果:\n{chr(10).join(lines)}\n\n"
-                )
-            else:
-                search_context = f"联网搜索失败: {search_result.get('error')}\n\n"
-
-        if "memory_store" in self._tool_map:
-            scope = "default-thread"
-            if context and context.metadata.get("thread_id"):
-                scope = str(context.metadata["thread_id"])
-            recall = self.get_tool("memory_store").run(
-                action="recall",
-                scope=scope,
-                namespace="writer_pref",
-                limit=3,
-            )
-            used_tools.append("memory_store")
-            if recall.get("ok"):
-                items = recall.get("data", {}).get("items", [])
-                if items:
-                    memory_context = f"历史写作偏好记忆: {items}\n\n"
-
-        composed_input = f"{memory_context}{search_context}{user_input}"
-        messages = self._build_messages(user_input=composed_input, memory=memory)
-        plan_text = self._call_llm(messages)
+        plan_text, used_tools, tool_traces, usage = self._run_with_tools(
+            user_input=user_input,
+            memory=memory,
+        )
         return {
             "agent": self.name,
             "stage": "plan",
             "plan_text": plan_text,
-            "plan_output": {
-                "task_goal": user_input,
-                "steps": [],
-                "step_inputs": [],
-                "step_outputs": [],
-                "risks": [],
-                "raw_plan_text": plan_text,
-            },
             "used_tools": used_tools,
-            "context": context.metadata if context else {},
+            "tool_traces": tool_traces,
+            "usage": usage,
         }

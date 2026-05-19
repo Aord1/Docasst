@@ -2,39 +2,51 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .base_tool import BaseTool
+from pydantic import BaseModel, Field
+
+from .base_tool import DocasstBaseTool
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-class SearchTool(BaseTool):
+class SearchArgs(BaseModel):
+    query: str = Field(description="搜索查询关键词")
+    max_results: int = Field(default=3, description="返回结果数量上限")
+
+
+class SearchTool(DocasstBaseTool):
     """
     联网搜索工具（优先级固定）：
     1) 先调用 Tavily
     2) Tavily 失败或无结果时回退 SerpApi
     """
 
-    name = "web_search"
-    description = "联网搜索工具：优先 Tavily，失败后回退 SerpApi。"
+    name: str = "web_search"
+    description: str = "联网搜索工具：优先 Tavily，失败后回退 SerpApi。用于获取最新事实、外部信息、时效内容。"
+    args_schema: Type[BaseModel] = SearchArgs
 
-    def __init__(
-        self,
-        tavily_api_key: Optional[str] = None,
-        serpapi_api_key: Optional[str] = None,
-    ) -> None:
-        self.tavily_api_key = tavily_api_key or os.getenv("TAVILY_API_KEY")
-        self.serpapi_api_key = serpapi_api_key or os.getenv("SERPAPI_API_KEY")
+    tavily_api_key: str = Field(default="", exclude=True)
+    serpapi_api_key: str = Field(default="", exclude=True)
 
-    def _run(self, **kwargs: Any) -> Dict[str, Any]:
-        query = kwargs.get("query")
-        max_results = int(kwargs.get("max_results", 5))
+    def __init__(self, tavily_api_key: Optional[str] = None, serpapi_api_key: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)
+        if tavily_api_key:
+            self.tavily_api_key = tavily_api_key
+        elif os.getenv("TAVILY_API_KEY"):
+            self.tavily_api_key = os.getenv("TAVILY_API_KEY", "")
+        if serpapi_api_key:
+            self.serpapi_api_key = serpapi_api_key
+        elif os.getenv("SERPAPI_API_KEY"):
+            self.serpapi_api_key = os.getenv("SERPAPI_API_KEY", "")
+
+    def _execute(self, query: str = "", max_results: int = 3, **kwargs) -> Dict[str, Any]:
         if not query:
             raise ValueError("web_search 工具需要提供 query 参数")
 
@@ -53,12 +65,7 @@ class SearchTool(BaseTool):
             attempts.append({"provider": "tavily", "ok": False, "message": "未配置 TAVILY_API_KEY"})
 
         if tavily_results:
-            return {
-                "provider": "tavily",
-                "query": query,
-                "results": tavily_results,
-                "attempts": attempts,
-            }
+            return {"provider": "tavily", "query": query, "results": tavily_results, "attempts": attempts}
 
         serp_error = None
         serp_results: List[Dict[str, Any]] = []
@@ -73,60 +80,38 @@ class SearchTool(BaseTool):
             attempts.append({"provider": "serpapi", "ok": False, "message": "未配置 SERPAPI_API_KEY"})
 
         if serp_results:
-            return {
-                "provider": "serpapi",
-                "query": query,
-                "results": serp_results,
-                "attempts": attempts,
-            }
+            return {"provider": "serpapi", "query": query, "results": serp_results, "attempts": attempts}
 
-        raise RuntimeError(
-            "所有搜索源都失败或未返回结果。"
-            f" tavily_error={tavily_error}, serpapi_error={serp_error}"
-        )
+        raise RuntimeError(f"所有搜索源都失败。tavily_error={tavily_error}, serpapi_error={serp_error}")
+
+    def compact(self, result: Any) -> str:
+        """精简：最多3条结果，每条保留 title + snippet(300字)"""
+        if isinstance(result, dict) and "results" in result:
+            compact_results = []
+            for item in result["results"][:3]:
+                compact_results.append({
+                    "title": item.get("title", ""),
+                    "snippet": str(item.get("snippet", ""))[:300],
+                })
+            return json.dumps({"ok": True, "results": compact_results}, ensure_ascii=False)
+        return json.dumps({"ok": True, "data": result}, ensure_ascii=False, default=str)
 
     def _search_tavily(self, query: str, max_results: int) -> List[Dict[str, Any]]:
         url = "https://api.tavily.com/search"
-        payload = {
-            "api_key": self.tavily_api_key,
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "advanced",
-        }
+        payload = {"api_key": self.tavily_api_key, "query": query, "max_results": max_results, "search_depth": "advanced"}
         body = json.dumps(payload).encode("utf-8")
         request = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
         response = self._request_json(request)
         items = response.get("results", []) or []
-        return [
-            {
-                "title": item.get("title", ""),
-                "url": item.get("url", ""),
-                "snippet": item.get("content", ""),
-                "source": "tavily",
-            }
-            for item in items
-        ]
+        return [{"title": item.get("title", ""), "url": item.get("url", ""), "snippet": item.get("content", ""), "source": "tavily"} for item in items]
 
     def _search_serpapi(self, query: str, max_results: int) -> List[Dict[str, Any]]:
-        params = {
-            "engine": "google",
-            "q": query,
-            "api_key": self.serpapi_api_key,
-            "num": max_results,
-        }
+        params = {"engine": "google", "q": query, "api_key": self.serpapi_api_key, "num": max_results}
         url = f"https://serpapi.com/search.json?{urlencode(params)}"
         request = Request(url, method="GET")
         response = self._request_json(request)
         items = response.get("organic_results", []) or []
-        return [
-            {
-                "title": item.get("title", ""),
-                "url": item.get("link", ""),
-                "snippet": item.get("snippet", ""),
-                "source": "serpapi",
-            }
-            for item in items[:max_results]
-        ]
+        return [{"title": item.get("title", ""), "url": item.get("link", ""), "snippet": item.get("snippet", ""), "source": "serpapi"} for item in items[:max_results]]
 
     def _request_json(self, request: Request) -> Dict[str, Any]:
         try:

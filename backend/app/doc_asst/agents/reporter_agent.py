@@ -2,25 +2,33 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from langchain_openai import ChatOpenAI
+
 from ..core.agent import BaseAgent
-from ..core.contract import AgentContext
 
 
 class ReporterAgent(BaseAgent):
     """
     结果输出智能体：
     将前序阶段结果整合为最终交付内容（结论、建议、下一步）。
+    通过 Function Calling 可自主决定是否将结果存入记忆。
     """
 
     DEFAULT_SYSTEM_PROMPT = (
-        "你是写作助手（Writer Agent）。"
-        "请基于上游规划与研究证据输出可直接使用的写作结果。"
-        "输出必须包含：标题、提纲、正文草稿、引用来源、待确认项。"
+        "你是写作助手。基于上游规划与研究证据输出最终写作结果。"
+        "输出格式（严格按此）：\n"
+        "【标题】文章标题。\n"
+        "【正文】Markdown 格式的正文草稿，800字以内。\n"
+        "【来源】引用的关键来源列表。"
+        "不要输出提纲或待确认项。"
+        "\n\n工具调用策略："
+        "\n1. 不要调用 web_search 或 rag_search。"
+        "\n2. 仅当内容值得沉淀时调用 memory_store 保存，否则直接输出。"
     )
 
     def __init__(
         self,
-        llm: Any,
+        llm: ChatOpenAI,
         tools: Optional[List[Any]] = None,
         temperature: float = 0.2,
         system_prompt: Optional[str] = None,
@@ -36,40 +44,18 @@ class ReporterAgent(BaseAgent):
     def run(
         self,
         user_input: str,
-        context: Optional[AgentContext] = None,
         memory: Optional[List[Dict[str, str]]] = None,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
-        used_tools: List[str] = []
-        messages = self._build_messages(user_input=user_input, memory=memory)
-        final_text = self._call_llm(messages)
-
-        if "memory_store" in self._tool_map:
-            scope = "default-thread"
-            if context and context.metadata.get("thread_id"):
-                scope = str(context.metadata["thread_id"])
-            save_res = self.get_tool("memory_store").run(
-                action="save",
-                scope=scope,
-                namespace="writer_pref",
-                key="last_output_summary",
-                value={"preview": final_text[:280]},
-            )
-            used_tools.append("memory_store")
-            if not save_res.get("ok"):
-                # 记忆失败不阻断写作主流程
-                pass
-
+        final_text, used_tools, tool_traces, usage = self._run_with_tools(
+            user_input=user_input,
+            memory=memory,
+        )
         return {
             "agent": self.name,
             "stage": "write",
             "final_text": final_text,
-            "writer_output": {
-                "title": "",
-                "outline": [],
-                "draft_markdown": final_text,
-                "citations": [],
-                "uncertainties": [],
-            },
             "used_tools": used_tools,
-            "context": context.metadata if context else {},
+            "tool_traces": tool_traces,
+            "usage": usage,
         }

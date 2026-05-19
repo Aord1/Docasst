@@ -1,232 +1,137 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from datetime import datetime, timezone
-import hashlib
+import json
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Type
 
 from openai import OpenAI
-import psycopg
+from psycopg_pool import ConnectionPool
+from pydantic import BaseModel, Field, PrivateAttr
 
 from ..config import ENV
-from .base_tool import BaseTool
+from ..persistence.pool import get_pool
+from .base_tool import DocasstBaseTool
 
 
-@dataclass
-class _Chunk:
-    chunk_id: str
-    source_path: str
-    title: str
-    chunk_index: int
-    text: str
-    content_hash: str
+class RAGArgs(BaseModel):
+    query: str = Field(description="知识库检索查询文本")
+    top_k: int = Field(default=5, description="返回结果数量上限")
 
 
-class RAGTool(BaseTool):
+class RAGTool(DocasstBaseTool):
     """
-    PostgreSQL + pgvector RAG 工具：
-    - 读取本地文档
-    - 生成 embedding 并写入 pgvector
-    - 用向量相似度召回 top_k 片段
+    PostgreSQL + pgvector RAG 检索工具（只查库）：
+    - 查询向量化
+    - 候选召回
+    - 重排序输出 top_k
     """
 
-    name = "rag_search"
-    description = "基于 pgvector 的本地知识库检索工具。"
+    name: str = "rag_search"
+    description: str = "基于 pgvector 的本地知识库检索工具。用于查询项目内部文档、已有资料、历史记录。"
+    args_schema: Type[BaseModel] = RAGArgs
 
-    def __init__(
-        self,
-        source_dir: str | None = None,
-        postgres_dsn: str | None = None,
-        embedding_model: str | None = None,
-        embedding_dim: int | None = None,
-        default_top_k: int = 5,
-    ) -> None:
-        self.source_dir = Path(source_dir or os.getenv("RAG_SOURCE_DIR", "workspace/sources"))
-        self.postgres_dsn = postgres_dsn or os.getenv("LANGGRAPH_POSTGRES_DSN", "")
-        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL_ID", "text-embedding-3-small")
-        self.embedding_dim = int(embedding_dim or os.getenv("EMBEDDING_DIM", "1536"))
+    postgres_dsn: str = Field(default="", exclude=True)
+    embedding_model: str = "text-embedding-3-small"
+    default_top_k: int = 5
+    _client: Any = PrivateAttr(default=None)
+    _pool: Any = PrivateAttr(default=None)
+
+    def __init__(self, postgres_dsn: str | None = None, embedding_model: str | None = None, default_top_k: int = 5, **kwargs):
+        super().__init__(**kwargs)
+        if postgres_dsn:
+            self.postgres_dsn = postgres_dsn
+        elif os.getenv("LANGGRAPH_POSTGRES_DSN"):
+            self.postgres_dsn = os.getenv("LANGGRAPH_POSTGRES_DSN", "")
+        if embedding_model:
+            self.embedding_model = embedding_model
+        elif os.getenv("EMBEDDING_MODEL_ID"):
+            self.embedding_model = os.getenv("EMBEDDING_MODEL_ID", "text-embedding-3-small")
         self.default_top_k = default_top_k
-        self.client = OpenAI(
-            api_key=ENV.llm_api_key,
-            base_url=ENV.llm_base_url,
-            timeout=ENV.llm_timeout,
-        )
+        self._client = OpenAI(api_key=ENV.llm_api_key, base_url=ENV.llm_base_url, timeout=ENV.llm_timeout)
+        # 使用全局连接池，不再维护裸连
+        self._pool = get_pool()
 
-    def _run(self, **kwargs: Any) -> Dict[str, Any]:
-        query = str(kwargs.get("query", "")).strip()
-        top_k = int(kwargs.get("top_k", self.default_top_k))
+    def _get_conn(self):
+        """从连接池获取连接（上下文管理器，自动归还）。"""
+        if self._pool is None:
+            raise ValueError("缺少 LANGGRAPH_POSTGRES_DSN，无法使用 pgvector 检索")
+        return self._pool.connection()
+
+    def _execute(self, query: str = "", top_k: int = 5, **kwargs) -> Dict[str, Any]:
+        query = str(query).strip()
+        top_k = int(top_k) or self.default_top_k
         if not query:
             raise ValueError("rag_search 工具需要提供 query 参数")
-        if not self.postgres_dsn:
+        if self._pool is None:
             raise ValueError("缺少 LANGGRAPH_POSTGRES_DSN，无法使用 pgvector 检索")
 
-        # 每次查询前同步本地资料到向量表：V1 用“边查边增量索引”，实现简单可靠。
-        chunks = self._load_chunks()
-        query_vector = self._embed_text(query)
+        normalized_query = self._normalize_query(query)
+        query_terms = self._tokenize_query(normalized_query)
+        query_vector = self._embed_text(normalized_query)
+        candidate_k = top_k * 4
 
-        with psycopg.connect(self.postgres_dsn) as conn:
-            self._ensure_schema(conn)
-            self._upsert_chunks(conn, chunks)
-            rows = self._search(conn, query_vector=query_vector, top_k=top_k)
+        with self._pool.connection() as conn:
+            candidates = self._retrieve_candidates(conn, query_vector=query_vector, candidate_k=candidate_k)
+
+        rows = self._rerank(candidates=candidates, query_terms=query_terms, top_k=top_k)
 
         results = [
-            {
-                "title": row["title"],
-                "source_path": row["source_path"],
-                "snippet": row["content"],
-                "score": row["score"],
-                "source": "pgvector",
-            }
+            {"title": row["title"], "source_path": row["source_path"], "snippet": row["content"], "score": row["final_score"], "semantic_score": row["semantic_score"], "keyword_score": row["keyword_score"], "source": "pgvector"}
             for row in rows
         ]
-        return {
-            "query": query,
-            "top_k": top_k,
-            "source_dir": str(self.source_dir),
-            "vector_backend": "postgres_pgvector",
-            "results": results,
-            "indexed_chunks": len(chunks),
-        }
+        return {"query": query, "normalized_query": normalized_query, "top_k": top_k, "vector_backend": "postgres_pgvector", "results": results, "candidate_count": len(candidates)}
 
-    def _ensure_schema(self, conn: psycopg.Connection) -> None:
-        with conn.cursor() as cur:
-            # vector 扩展和表结构在首次调用自动初始化。
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS rag_chunks (
-                    chunk_id TEXT PRIMARY KEY,
-                    source_path TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    chunk_index INT NOT NULL,
-                    content TEXT NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    embedding VECTOR({self.embedding_dim}) NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                );
-                """
-            )
-        conn.commit()
+    def compact(self, result: Any) -> str:
+        """精简：最多3条结果，保留 title + source_path + snippet(300字)"""
+        if isinstance(result, dict) and "results" in result:
+            compact_results = []
+            for item in result["results"][:3]:
+                compact_results.append({
+                    "title": item.get("title", ""),
+                    "source_path": item.get("source_path", ""),
+                    "snippet": str(item.get("snippet", ""))[:300],
+                })
+            return json.dumps({"ok": True, "results": compact_results}, ensure_ascii=False)
+        return json.dumps({"ok": True, "data": result}, ensure_ascii=False, default=str)
 
-    def _upsert_chunks(self, conn: psycopg.Connection, chunks: List[_Chunk]) -> None:
-        if not chunks:
-            return
-
-        existing: Dict[str, str] = {}
-        with conn.cursor() as cur:
-            cur.execute("SELECT chunk_id, content_hash FROM rag_chunks;")
-            for row in cur.fetchall():
-                existing[str(row[0])] = str(row[1])
-
-        with conn.cursor() as cur:
-            for chunk in chunks:
-                # hash 未变化则跳过 embedding，减少无效开销。
-                if existing.get(chunk.chunk_id) == chunk.content_hash:
-                    continue
-                vector = self._embed_text(chunk.text)
-                cur.execute(
-                    """
-                    INSERT INTO rag_chunks
-                        (chunk_id, source_path, title, chunk_index, content, content_hash, embedding, updated_at)
-                    VALUES
-                        (%s, %s, %s, %s, %s, %s, %s::vector, %s)
-                    ON CONFLICT (chunk_id) DO UPDATE
-                    SET source_path = EXCLUDED.source_path,
-                        title = EXCLUDED.title,
-                        chunk_index = EXCLUDED.chunk_index,
-                        content = EXCLUDED.content,
-                        content_hash = EXCLUDED.content_hash,
-                        embedding = EXCLUDED.embedding,
-                        updated_at = EXCLUDED.updated_at;
-                    """,
-                    (
-                        chunk.chunk_id,
-                        chunk.source_path,
-                        chunk.title,
-                        chunk.chunk_index,
-                        chunk.text,
-                        chunk.content_hash,
-                        self._vector_literal(vector),
-                        datetime.now(timezone.utc),
-                    ),
-                )
-        conn.commit()
-
-    def _search(self, conn: psycopg.Connection, query_vector: List[float], top_k: int) -> List[Dict[str, Any]]:
+    def _retrieve_candidates(self, conn: psycopg.Connection, query_vector: List[float], candidate_k: int) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                SELECT
-                    title,
-                    source_path,
-                    content,
-                    (1 - (embedding <=> %s::vector)) AS score
-                FROM rag_chunks
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s;
-                """,
-                (self._vector_literal(query_vector), self._vector_literal(query_vector), top_k),
+                "SELECT title, source_path, content, (1 - (embedding <=> %s::vector)) AS semantic_score FROM rag_chunks ORDER BY embedding <=> %s::vector LIMIT %s;",
+                (self._vector_literal(query_vector), self._vector_literal(query_vector), candidate_k),
             )
             rows = cur.fetchall()
+        return [{"title": str(row[0]), "source_path": str(row[1]), "content": str(row[2]), "semantic_score": float(row[3])} for row in rows]
 
-        return [
-            {
-                "title": str(row[0]),
-                "source_path": str(row[1]),
-                "content": str(row[2]),
-                "score": float(row[3]),
-            }
-            for row in rows
-        ]
+    def _rerank(self, candidates: List[Dict[str, Any]], query_terms: Set[str], top_k: int) -> List[Dict[str, Any]]:
+        reranked: List[Dict[str, Any]] = []
+        for row in candidates:
+            semantic_score = float(row.get("semantic_score", 0.0))
+            keyword_score = self._keyword_overlap_score(query_terms, row.get("content", ""))
+            final_score = (semantic_score * 0.8) + (keyword_score * 0.2)
+            reranked.append({**row, "keyword_score": keyword_score, "final_score": final_score})
+        reranked.sort(key=lambda x: x["final_score"], reverse=True)
+        return reranked[:top_k]
 
-    def _load_chunks(self) -> List[_Chunk]:
-        if not self.source_dir.exists():
-            return []
+    def _normalize_query(self, query: str) -> str:
+        query = query.strip().lower()
+        query = re.sub(r"\s+", " ", query)
+        return query
 
-        chunks: List[_Chunk] = []
-        for file_path in self.source_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix.lower() not in {".md", ".txt"}:
-                continue
+    def _tokenize_query(self, query: str) -> Set[str]:
+        tokens = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]+", query)
+        return {t for t in tokens if len(t) >= 2}
 
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-            parts = self._split_text(text)
-            for index, part in enumerate(parts):
-                key = f"{file_path}:{index}:{part}"
-                content_hash = hashlib.sha256(part.encode("utf-8")).hexdigest()
-                chunk_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
-                chunks.append(
-                    _Chunk(
-                        chunk_id=chunk_id,
-                        source_path=str(file_path),
-                        title=file_path.stem,
-                        chunk_index=index,
-                        text=part,
-                        content_hash=content_hash,
-                    )
-                )
-        return chunks
-
-    def _split_text(self, text: str) -> List[str]:
-        # 先按空行切段，再对长段切窗，平衡语义完整性和召回粒度。
-        blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
-        parts: List[str] = []
-        for block in blocks:
-            if len(block) <= 800:
-                parts.append(block)
-                continue
-            for i in range(0, len(block), 800):
-                piece = block[i : i + 800].strip()
-                if piece:
-                    parts.append(piece)
-        return parts
+    def _keyword_overlap_score(self, query_terms: Set[str], content: str) -> float:
+        if not query_terms:
+            return 0.0
+        normalized_content = content.lower()
+        hit = sum(1 for term in query_terms if term in normalized_content)
+        return hit / len(query_terms)
 
     def _embed_text(self, text: str) -> List[float]:
-        resp = self.client.embeddings.create(model=self.embedding_model, input=text)
+        resp = self._client.embeddings.create(model=self.embedding_model, input=text)
         return list(resp.data[0].embedding)
 
     def _vector_literal(self, vec: List[float]) -> str:

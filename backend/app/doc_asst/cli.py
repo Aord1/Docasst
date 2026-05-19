@@ -4,7 +4,7 @@ import argparse
 import json
 
 from .config.settings import DEFAULT_THREAD_ID, ENABLE_POSTGRES_CHECKPOINT
-from .orchestrator import run_workflow
+from .orchestrator import run_workflow_stream
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,17 +19,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--verbose", action="store_true", help="显示节点执行日志与输出预览")
     parser.add_argument("--json", action="store_true", help="输出完整 JSON 结果")
+    parser.add_argument("--max-iterations", type=int, default=2, help="ReAct + Reflection 最大迭代轮次")
+    parser.add_argument("--file", action="append", default=[], help="上传文件路径，可重复传入多个 --file")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    state = run_workflow(
+    final_state = {}
+    for chunk in run_workflow_stream(
         user_input=args.input,
         thread_id=args.thread_id,
         use_postgres_checkpoint=args.checkpoint,
         verbose=args.verbose,
-    )
+        max_iterations=args.max_iterations,
+        uploaded_files=args.file or None,
+    ):
+        print(f"[stream] {json.dumps(chunk, ensure_ascii=False, default=str)}")
+        if isinstance(chunk, dict):
+            for _, val in chunk.items():
+                if isinstance(val, dict):
+                    final_state.update(val)
+    state = final_state
     if args.json:
         print(json.dumps(state, ensure_ascii=False, indent=2, default=str))
         return

@@ -1,53 +1,37 @@
-from openai import OpenAI
-from typing import List, Dict
+from __future__ import annotations
+
+from langchain_openai import ChatOpenAI
+
 from ..config import ENV
 
 
-class HelloAgentsLLM:
+def create_chat_model(temperature: float = 0.2) -> ChatOpenAI:
     """
-    为本书 "Hello Agents" 定制的LLM客户端。
-    它用于调用任何兼容OpenAI接口的服务，并默认使用流式响应。
+    创建 LangChain ChatOpenAI 实例。
+    统一 LLM 调用层：供 create_react_agent 和直接 invoke 使用。
     """
-    def __init__(self, model: str = None, apiKey: str = None, baseUrl: str = None, timeout: int = None):
-        """
-        初始化客户端。优先使用传入参数，如果未提供，则从环境变量加载。
-        """
-        self.model = model or ENV.llm_model_id
-        apiKey = apiKey or ENV.llm_api_key
-        baseUrl = baseUrl or ENV.llm_base_url
-        timeout = timeout or ENV.llm_timeout
-        
-        if not all([self.model, apiKey, baseUrl]):
-            raise ValueError("模型ID、API密钥和服务地址必须被提供或在.env文件中定义。")
-
-        self.client = OpenAI(api_key=apiKey, base_url=baseUrl, timeout=timeout)
-
-    def think(self, messages: List[Dict[str, str]], temperature: float = 0) -> str:
-        """
-        调用大语言模型进行思考，并返回其响应。
-        """
-        print(f" 正在调用 {self.model} 模型...")
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                stream=True,
-            )
-            
-            # 处理流式响应
-            print(" 大语言模型响应成功:")
-            collected_content = []
-            for chunk in response:
-                content = chunk.choices[0].delta.content or ""
-                print(content, end="", flush=True)
-                collected_content.append(content)
-            print()  # 在流式输出结束后换行
-            return "".join(collected_content)
-
-        except Exception as e:
-            print(f" 调用LLM API时发生错误: {e}")
-            return None
+    if not all([ENV.llm_model_id, ENV.llm_api_key, ENV.llm_base_url]):
+        raise ValueError("模型ID、API密钥和服务地址必须被提供或在.env文件中定义。")
+    return ChatOpenAI(
+        model=ENV.llm_model_id,
+        api_key=ENV.llm_api_key,
+        base_url=ENV.llm_base_url,
+        temperature=temperature,
+        streaming=True,
+        timeout=ENV.llm_timeout,
+        max_retries=3,
+    )
 
 
+def create_vision_openai_client() -> tuple:
+    """
+    创建视觉模型用的 OpenAI 原生客户端（供 FileContentTool OCR 使用）。
+    返回 (client, model_name)。
+    """
+    from openai import OpenAI
 
+    api_key = ENV.vision_api_key or ENV.llm_api_key
+    base_url = ENV.vision_base_url or ENV.llm_base_url
+    model = ENV.vision_model_id or ENV.llm_model_id
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=ENV.llm_timeout)
+    return client, model

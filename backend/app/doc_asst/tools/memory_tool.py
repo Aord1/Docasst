@@ -1,135 +1,103 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
-import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Type
 
-import psycopg
+from langgraph.store.base import BaseStore
+from pydantic import BaseModel, Field
 
-from .base_tool import BaseTool
+from ..persistence.store import get_store as get_global_store
+from .base_tool import DocasstBaseTool
 
 
-class MemoryTool(BaseTool):
+class MemoryArgs(BaseModel):
+    action: str = Field(description="操作类型：save 保存记忆，recall 召回记忆", enum=["save", "recall"])
+    memory_type: str = Field(default="short", description="记忆类型：short 短期记忆，long 长期记忆", enum=["short", "long"])
+    query: Optional[str] = Field(default=None, description="recall 时的语义检索查询文本")
+    key: Optional[str] = Field(default=None, description="save 时的记忆键名")
+    value: Optional[Any] = Field(default=None, description="save 时保存的内容")
+    limit: int = Field(default=5, description="recall 时返回结果数量上限")
+    scope: Optional[str] = Field(default=None, exclude=True)
+    namespace: Optional[str] = Field(default="writer", exclude=True)
+
+
+class MemoryTool(DocasstBaseTool):
     """
-    轻量记忆工具（PostgreSQL）：
-    - save: 保存键值记忆
-    - recall: 按 scope/thread_id + namespace 读取最近记忆
+    基于 LangGraph Store 的记忆工具（支持"短期 + 长期"）。
+
+    Store 实例来源优先级：
+    1. LangGraph config 注入的 store（graph.compile(store=store)）
+    2. 全局 get_store() 单例
     """
 
-    name = "memory_store"
-    description = "持久化记忆工具，支持 save/recall。"
+    name: str = "memory_store"
+    description: str = "持久化记忆工具，支持 save（保存）和 recall（召回）。短期记忆按会话隔离，长期记忆跨会话持久化。"
+    args_schema: Type[BaseModel] = MemoryArgs
 
-    def __init__(self, postgres_dsn: str | None = None) -> None:
-        self.postgres_dsn = postgres_dsn or os.getenv("LANGGRAPH_POSTGRES_DSN", "")
+    def _get_store(self) -> BaseStore:
+        """
+        获取 Store 实例。
+        优先使用 LangGraph 注入的 store，否则 fallback 到全局单例。
+        """
+        store = self.get_store()
+        if store is not None:
+            return store
+        return get_global_store()
 
-    def _run(self, **kwargs: Any) -> Dict[str, Any]:
-        action = str(kwargs.get("action", "")).strip().lower()
-        scope = str(kwargs.get("scope", "default-thread"))
-        namespace = str(kwargs.get("namespace", "writer"))
-        key = str(kwargs.get("key", "")).strip()
-        limit = int(kwargs.get("limit", 5))
+    def _execute(self, action: str = "", memory_type: str = "short", query: Optional[str] = None, key: Optional[str] = None, value: Any = None, limit: int = 5, scope: Optional[str] = None, namespace: str = "writer", **kwargs) -> Dict[str, Any]:
+        action = action.strip().lower()
+        memory_type = memory_type.strip().lower()
+        if memory_type not in {"short", "long"}:
+            raise ValueError("memory_type 仅支持 short 或 long")
+        if not scope:
+            scope = "default-thread" if memory_type == "short" else "default-user"
 
-        if not self.postgres_dsn:
-            raise ValueError("缺少 LANGGRAPH_POSTGRES_DSN，无法使用 memory_store")
+        store = self._get_store()
 
-        with psycopg.connect(self.postgres_dsn) as conn:
-            self._ensure_schema(conn)
-            if action == "save":
-                value = kwargs.get("value")
-                if not key:
-                    raise ValueError("save 动作需要 key")
-                self._save(conn, scope=scope, namespace=namespace, key=key, value=value)
-                return {"action": "save", "scope": scope, "namespace": namespace, "key": key, "saved": True}
+        if action == "save":
+            if not key:
+                raise ValueError("save 动作需要 key")
+            self._save(store, memory_type, scope, namespace, key, value)
+            return {"action": "save", "memory_type": memory_type, "scope": scope, "namespace": namespace, "key": key, "saved": True}
 
-            if action == "recall":
-                rows = self._recall(conn, scope=scope, namespace=namespace, key=key or None, limit=limit)
-                return {"action": "recall", "scope": scope, "namespace": namespace, "items": rows}
+        if action == "recall":
+            rows = self._recall(store, memory_type, scope, namespace, key, query, limit)
+            return {"action": "recall", "memory_type": memory_type, "scope": scope, "namespace": namespace, "query": query, "items": rows}
 
-            raise ValueError("memory_store action 仅支持 save 或 recall")
+        raise ValueError("memory_store action 仅支持 save 或 recall")
 
-    def _ensure_schema(self, conn: psycopg.Connection) -> None:
-        with conn.cursor() as cur:
-            # scope + namespace + key 组合定义一类记忆数据。
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memory_records (
-                    id BIGSERIAL PRIMARY KEY,
-                    scope TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value_json JSONB NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                );
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_memory_scope_ns_key
-                ON memory_records (scope, namespace, key, updated_at DESC);
-                """
-            )
-        conn.commit()
+    def compact(self, result: Any) -> str:
+        """记忆结果精简：只保留核心字段"""
+        if isinstance(result, dict):
+            compact = {"ok": True, "action": result.get("action")}
+            if result.get("action") == "save":
+                compact["key"] = result.get("key", "")
+                compact["saved"] = True
+            elif result.get("action") == "recall":
+                items = result.get("items", [])[:3]
+                compact["items"] = [{"key": i.get("key"), "value": i.get("value")} for i in items]
+            return json.dumps(compact, ensure_ascii=False, default=str)
+        return json.dumps({"ok": True, "data": result}, ensure_ascii=False, default=str)
 
-    def _save(
-        self,
-        conn: psycopg.Connection,
-        scope: str,
-        namespace: str,
-        key: str,
-        value: Any,
-    ) -> None:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO memory_records (scope, namespace, key, value_json, updated_at)
-                VALUES (%s, %s, %s, %s::jsonb, %s);
-                """,
-                (
-                    scope,
-                    namespace,
-                    key,
-                    json.dumps(value, ensure_ascii=False),
-                    datetime.now(timezone.utc),
-                ),
-            )
-        conn.commit()
+    def _save(self, store: BaseStore, memory_type: str, scope: str, namespace: str, key: str, value: Any) -> None:
+        value_json = value if isinstance(value, dict) else {"raw": value}
+        text = json.dumps(value_json, ensure_ascii=False)
+        store.put(
+            self._namespace_tuple(memory_type, scope, namespace),
+            key,
+            {"memory_type": memory_type, "scope": scope, "namespace": namespace, "key": key, "text": text, "value": value_json},
+            index=["text"],
+        )
 
-    def _recall(
-        self,
-        conn: psycopg.Connection,
-        scope: str,
-        namespace: str,
-        key: str | None,
-        limit: int,
-    ) -> List[Dict[str, Any]]:
-        with conn.cursor() as cur:
-            # key 为空时按 namespace 回看最近记忆；有 key 时读取同键历史版本。
-            if key:
-                cur.execute(
-                    """
-                    SELECT key, value_json, updated_at
-                    FROM memory_records
-                    WHERE scope = %s AND namespace = %s AND key = %s
-                    ORDER BY updated_at DESC
-                    LIMIT %s;
-                    """,
-                    (scope, namespace, key, limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT key, value_json, updated_at
-                    FROM memory_records
-                    WHERE scope = %s AND namespace = %s
-                    ORDER BY updated_at DESC
-                    LIMIT %s;
-                    """,
-                    (scope, namespace, limit),
-                )
-            rows = cur.fetchall()
+    def _recall(self, store: BaseStore, memory_type: str, scope: str, namespace: str, key: str | None, query: str | None, limit: int) -> List[Dict[str, Any]]:
+        ns = self._namespace_tuple(memory_type, scope, namespace)
+        if key:
+            item = store.get(ns, key)
+            if not item:
+                return []
+            return [{"key": item.key, "value": item.value.get("value"), "score": None, "updated_at": item.updated_at.isoformat() if item.updated_at else None}]
+        results = store.search(ns, query=query, limit=limit)
+        return [{"key": it.key, "value": it.value.get("value"), "score": it.score, "updated_at": it.updated_at.isoformat() if it.updated_at else None} for it in results]
 
-        return [
-            {"key": str(row[0]), "value": row[1], "updated_at": row[2].isoformat() if row[2] else None}
-            for row in rows
-        ]
+    def _namespace_tuple(self, memory_type: str, scope: str, namespace: str) -> tuple[str, ...]:
+        return ("docasst_memory", memory_type, scope, namespace)

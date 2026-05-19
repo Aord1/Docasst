@@ -12,3 +12,7 @@ wheels/
 
 # Local environment files
 .env
+
+# Frontend
+frontend/node_modules/
+frontend/dist/

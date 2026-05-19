@@ -2,6 +2,7 @@ from .env import ENV, EnvConfig
 from .settings import (
     AGENT_TOOL_POLICY,
     DEFAULT_THREAD_ID,
+    ENABLE_FILE_CONTENT_READER,
     ENABLE_MEMORY,
     ENABLE_POSTGRES_CHECKPOINT,
     ENABLE_RAG,
@@ -13,6 +14,7 @@ __all__ = [
     "EnvConfig",
     "AGENT_TOOL_POLICY",
     "DEFAULT_THREAD_ID",
+    "ENABLE_FILE_CONTENT_READER",
     "ENABLE_MEMORY",
     "ENABLE_POSTGRES_CHECKPOINT",
     "ENABLE_RAG",
