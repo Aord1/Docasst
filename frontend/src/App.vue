@@ -1,7 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from "vue";
 
-const apiBase = "http://127.0.0.1:8000";
+const apiBase = import.meta.env.VITE_API_BASE || "";
 const activeNav = ref("chat");
 const chatInput = ref("");
 const tenantId = ref("default");

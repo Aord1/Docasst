@@ -1,6 +1,7 @@
 # DocAsst
 
 DocAsst 是一个基于 LangGraph 的多 Agent 文档研究与写作助手，支持：
+
 - CLI 对话与流式工作流输出
 - FastAPI 后端接口（含流式聊天）
 - Vue 3 前端会话界面
@@ -24,6 +25,7 @@ DocAsst 是一个基于 LangGraph 的多 Agent 文档研究与写作助手，支
 ## 工作流（LangGraph）
 
 执行链路：
+
 1. `simple_router`（判断简单问答/完整流程）
 2. `planner`
 3. `extractor_summarizer`
@@ -31,6 +33,7 @@ DocAsst 是一个基于 LangGraph 的多 Agent 文档研究与写作助手，支
 5. `reflection`（可回到 `extractor_summarizer` 继续迭代）
 
 核心工具：
+
 - `web_search`：Tavily 优先，SerpApi 回退
 - `rag_search`：PostgreSQL + pgvector 检索
 - `memory_store`：记忆存取
@@ -44,7 +47,29 @@ DocAsst 是一个基于 LangGraph 的多 Agent 文档研究与写作助手，支
 
 ## 快速开始
 
-### 1) 安装依赖
+### 方式一：Docker 部署（推荐）
+
+1. 复制环境变量并填写 API Key：
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少填写 LLM_API_KEY
+```
+
+2. 一键启动：
+
+```bash
+docker-compose up -d
+```
+
+3. 访问 `http://localhost:8000`
+
+Docker 会自动构建前端、初始化数据库（PostgreSQL + pgvector）、启动后端服务。
+上传文件和知识库数据持久化在 Docker volumes 中。
+
+### 方式二：本地开发
+
+#### 1) 安装依赖
 
 推荐使用 `uv`：
 
@@ -67,6 +92,7 @@ cp .env.example .env
 ```
 
 关键变量说明：
+
 - `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_ID`：主模型配置
 - `VISION_*`：图片 OCR / 视觉模型配置
 - `TAVILY_API_KEY`、`SERPAPI_API_KEY`：联网搜索
@@ -82,6 +108,7 @@ docasst --input "帮我总结 workspace/sources 下的写作规范"
 ```
 
 常用参数：
+
 - `--thread-id`：会话隔离 ID
 - `--max-iterations`：反思迭代次数（默认 2）
 - `--file`：上传文件（可重复）
@@ -107,6 +134,7 @@ GET /api/health
 ```
 
 核心接口：
+
 - `POST /api/chat`：同步返回最终结果
 - `POST /api/chat/stream`：NDJSON 流式输出
 - `POST /api/files/upload`：对话附件上传
@@ -125,6 +153,7 @@ npm run dev
 ## 知识库与数据库说明
 
 `RAGIngestor` 默认会写入以下表（需提前建表）：
+
 - `rag_documents`
 - `rag_chunks`（`embedding` 字段为 `vector`）
 

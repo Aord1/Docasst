@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+.venv
+*.egg-info
+dist/
+build/
+
+# Frontend dev files (built inside Docker)
+frontend/node_modules/
+
+# Local env (sensitive)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docs (not needed at runtime)
+docs/
+
+# Docker
+docker/
+
+# Misc
+workspace/uploads/
+*.md
+!README.md

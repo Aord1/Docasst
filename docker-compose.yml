@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL + pgvector ────────────────────────────────
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docasst
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docasst123}
+      POSTGRES_DB: docasst
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docasst"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── DocAsst 后端 + 前端静态文件 ──────────────────────────
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # PostgreSQL
+      LANGGRAPH_POSTGRES_DSN: postgresql://docasst:${POSTGRES_PASSWORD:-docasst123}@db:5432/docasst
+      # LLM（必须填写）
+      LLM_API_KEY: ${LLM_API_KEY:?请在 .env 中设置 LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
+      LLM_MODEL_ID: ${LLM_MODEL_ID:-deepseek-chat}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
+      # Vision（可选，默认复用 LLM 配置）
+      VISION_API_KEY: ${VISION_API_KEY:-}
+      VISION_BASE_URL: ${VISION_BASE_URL:-}
+      VISION_MODEL_ID: ${VISION_MODEL_ID:-}
+      # 搜索（可选）
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SERPAPI_API_KEY: ${SERPAPI_API_KEY:-}
+      # 向量化
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-text-embedding-3-small}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1536}
+    volumes:
+      - uploads:/app/workspace/uploads
+      - sources:/app/workspace/sources
+    ports:
+      - "${APP_PORT:-8000}:8000"
+
+volumes:
+  pgdata:
+  uploads:
+  sources:

@@ -16,3 +16,6 @@ wheels/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+
+# Docker
+docker/postgres-data/
