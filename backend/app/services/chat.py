@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Any, Dict, Iterator, List, Optional
 from uuid import uuid4
 
+from fastapi import HTTPException
+
 from ..doc_asst.orchestrator import run_workflow_stream
 
 
@@ -23,17 +25,22 @@ class ChatService:
         tid = self.resolve_thread_id(thread_id)
         final_state: Dict[str, Any] = {}
 
-        for chunk in run_workflow_stream(
-            user_input=message,
-            memory=memory,
-            thread_id=tid,
-            max_iterations=max_iterations,
-            uploaded_files=uploaded_files or None,
-        ):
-            if isinstance(chunk, dict):
-                for _, value in chunk.items():
-                    if isinstance(value, dict):
-                        final_state.update(value)
+        try:
+            for chunk in run_workflow_stream(
+                user_input=message,
+                memory=memory,
+                thread_id=tid,
+                max_iterations=max_iterations,
+                uploaded_files=uploaded_files or None,
+            ):
+                if isinstance(chunk, dict):
+                    for _, value in chunk.items():
+                        if isinstance(value, dict):
+                            final_state.update(value)
+        except ConnectionError as exc:
+            raise HTTPException(status_code=503, detail="LLM 服务不可用") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"LLM 调用失败: {exc}") from exc
 
         return {
             "thread_id": tid,
