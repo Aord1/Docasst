@@ -68,7 +68,7 @@ def chat_stream(req: ChatRequest):
 
 
 @router.post("/knowledge/import")
-async def import_knowledge(
+def import_knowledge(
     file: UploadFile = File(...),
     tenant_id: str = Form(default="default"),
 ) -> Dict[str, Any]:
@@ -82,7 +82,7 @@ async def import_knowledge(
 
 
 @router.post("/files/upload")
-async def upload_chat_file(file: UploadFile = File(...)) -> Dict[str, Any]:
+def upload_chat_file(file: UploadFile = File(...)) -> Dict[str, Any]:
     try:
         save_path = _file_svc.save_upload(file.filename, file.file)
     finally:
