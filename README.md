@@ -1,172 +1,153 @@
 # DocAsst
 
-DocAsst 是一个基于 LangGraph 的多 Agent 文档研究与写作助手，支持：
+基于 LangGraph 的多 Agent 文档研究与写作助手，支持联网搜索、知识库检索、文件解析与多轮反思优化。
 
-- CLI 对话与流式工作流输出
-- FastAPI 后端接口（含流式聊天）
-- Vue 3 前端会话界面
-- 本地文件读取与知识库（PostgreSQL + pgvector）检索
+## 功能特性
 
-## 当前项目概览
+- **多 Agent 工作流**：Planner → Extractor/Summarizer → Reporter，支持 Reflection 迭代优化
+- **联网搜索**：Tavily 优先，SerpApi 回退
+- **RAG 知识库**：PostgreSQL + pgvector 向量检索
+- **多格式文件解析**：txt / md / pdf / docx / 图片 OCR
+- **流式对话**：NDJSON 实时推送节点进度
+- **Vue 3 前端**：会话列表、文件上传、知识库导入
 
-- 后端：`backend/app`
-  - `doc_asst/`：多 Agent 工作流、工具层、RAG、持久化
-  - `api/`：HTTP 接口（聊天、文件上传、知识库导入）
-  - `main.py`：FastAPI 应用入口
-- 前端：`frontend/`
-  - Vue 3 + Vite 单页应用
-  - 支持会话列表、流式回复、文件上传、知识库导入
-- 文档：`docs/`
-  - `architecture.md`、`roadmap.md` 等
-- 工作目录：`workspace/`
-  - `sources/`：知识源文件
-  - `uploads/`：上传文件落盘目录（运行时自动创建）
+## 项目结构
 
-## 工作流（LangGraph）
-
-执行链路：
-
-1. `simple_router`（判断简单问答/完整流程）
-2. `planner`
-3. `extractor_summarizer`
-4. `reporter`
-5. `reflection`（可回到 `extractor_summarizer` 继续迭代）
-
-核心工具：
-
-- `web_search`：Tavily 优先，SerpApi 回退
-- `rag_search`：PostgreSQL + pgvector 检索
-- `memory_store`：记忆存取
-- `file_content_reader`：读取 txt/md/pdf/docx/图片 OCR
+```
+.
+├── backend/app/
+│   ├── main.py                  # FastAPI 入口
+│   ├── api/routes.py            # HTTP 接口定义
+│   ├── services/                # 业务服务层（chat、file）
+│   └── doc_asst/
+│       ├── agents/              # Agent 实现（planner、reporter 等）
+│       ├── orchestrator/        # LangGraph 工作流编排
+│       ├── tools/               # 工具层（搜索、RAG、文件读取、记忆）
+│       ├── rag/                 # RAG 入库与检索
+│       ├── skills/              # 技能注册
+│       ├── config/              # 配置加载
+│       └── cli.py               # CLI 入口
+├── frontend/src/
+│   └── App.vue                  # Vue 3 单页应用
+├── workspace/
+│   ├── sources/                 # 知识源文件
+│   └── uploads/                 # 上传文件（运行时自动创建）
+├── docker-compose.yml           # Docker 一键部署
+├── Dockerfile
+└── pyproject.toml
+```
 
 ## 环境要求
 
-- Python `>=3.10`
-- Node.js `>=18`（前端开发）
-- PostgreSQL（启用 RAG / checkpoint 时建议安装 `pgvector`）
+- Python >= 3.10
+- Node.js >= 18（前端开发）
+- PostgreSQL 16+（建议安装 pgvector 扩展）
 
 ## 快速开始
 
 ### 方式一：Docker 部署（推荐）
 
-1. 复制环境变量并填写 API Key：
-
 ```bash
+# 1. 配置环境变量
 cp .env.example .env
 # 编辑 .env，至少填写 LLM_API_KEY
-```
 
-2. 一键启动：
-
-```bash
+# 2. 启动
 docker-compose up -d
+
+# 3. 访问
+# http://localhost:8000
 ```
 
-3. 访问 `http://localhost:8000`
-
-Docker 会自动构建前端、初始化数据库（PostgreSQL + pgvector）、启动后端服务。
-上传文件和知识库数据持久化在 Docker volumes 中。
+Docker 会自动构建前端、初始化 PostgreSQL + pgvector、启动后端。上传文件和知识库数据持久化在 Docker volumes 中。
 
 ### 方式二：本地开发
 
-#### 1) 安装依赖
-
-推荐使用 `uv`：
+#### 安装依赖
 
 ```bash
+# 推荐 uv
 uv sync
-```
 
-或使用 `pip`：
-
-```bash
+# 或 pip
 pip install -e .
 ```
 
-### 2) 配置环境变量
-
-复制并编辑：
+#### 配置环境变量
 
 ```bash
 cp .env.example .env
 ```
 
-关键变量说明：
+| 变量 | 说明 |
+|------|------|
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_ID` | 主模型（默认 DeepSeek） |
+| `VISION_API_KEY` / `VISION_BASE_URL` / `VISION_MODEL_ID` | 视觉/OCR 模型（可选，默认复用 LLM） |
+| `TAVILY_API_KEY` / `SERPAPI_API_KEY` | 联网搜索（可选） |
+| `LANGGRAPH_POSTGRES_DSN` | PostgreSQL 连接串 |
+| `EMBEDDING_MODEL_ID` / `EMBEDDING_DIM` | 向量模型配置 |
 
-- `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_ID`：主模型配置
-- `VISION_*`：图片 OCR / 视觉模型配置
-- `TAVILY_API_KEY`、`SERPAPI_API_KEY`：联网搜索
-- `LANGGRAPH_POSTGRES_DSN`：Postgres 连接串
-- `EMBEDDING_MODEL_ID`、`EMBEDDING_DIM`：向量化配置
-
-## 运行方式
-
-### A. CLI（最小可用）
-
-```bash
-docasst --input "帮我总结 workspace/sources 下的写作规范"
-```
-
-常用参数：
-
-- `--thread-id`：会话隔离 ID
-- `--max-iterations`：反思迭代次数（默认 2）
-- `--file`：上传文件（可重复）
-- `--json`：输出完整 JSON
-- `--verbose`：显示节点日志
-
-RAG 入库 CLI：
-
-```bash
-docasst-ingest --file workspace/sources/writing_guidelines.md --tenant-id default
-```
-
-### B. 启动后端 API
+#### 启动后端
 
 ```bash
 uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-健康检查：
+#### 启动前端
 
 ```bash
-GET /api/health
+cd frontend && npm install && npm run dev
 ```
 
-核心接口：
+## 使用方式
 
-- `POST /api/chat`：同步返回最终结果
-- `POST /api/chat/stream`：NDJSON 流式输出
-- `POST /api/files/upload`：对话附件上传
-- `POST /api/knowledge/import`：知识库文件导入并入向量库
-
-### C. 启动前端
+### CLI
 
 ```bash
-cd frontend
-npm install
-npm run dev
+# 基础用法
+docasst --input "帮我总结 workspace/sources 下的写作规范"
+
+# 带文件上传
+docasst --input "分析这份报告" --file report.pdf
+
+# 完整参数
+docasst --input "..." --thread-id my-session --max-iterations 3 --verbose --json
 ```
 
-默认前端会请求 `http://127.0.0.1:8000`，请先启动后端。
+RAG 入库：
 
-## 知识库与数据库说明
+```bash
+docasst-ingest --file workspace/sources/writing_guidelines.md --tenant-id default
+```
 
-`RAGIngestor` 默认会写入以下表（需提前建表）：
+### API 接口
 
-- `rag_documents`
-- `rag_chunks`（`embedding` 字段为 `vector`）
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/health` | GET | 健康检查 |
+| `/api/chat` | POST | 同步对话，返回最终结果 |
+| `/api/chat/stream` | POST | NDJSON 流式对话 |
+| `/api/files/upload` | POST | 对话附件上传 |
+| `/api/knowledge/import` | POST | 知识库导入（入库向量库） |
 
-如果未配置可用 Postgres，RAG 与 checkpoint 相关能力将不可用或退化。
+## 工作流
 
-## 开发命令参考
+```
+用户输入
+  → simple_router（判断简单问答 / 完整流程）
+  → planner（拆解任务、规划步骤）
+  → extractor_summarizer（搜索、RAG 检索、文件读取、汇总）
+  → reporter（生成最终报告）
+  → reflection（质量评估，不满意则回到 extractor_summarizer 迭代）
+```
 
-- 后端入口：`backend/app/main.py`
-- CLI 入口：`backend/app/doc_asst/cli.py`
-- 工作流定义：`backend/app/doc_asst/orchestrator/graph.py`
-- 前端主界面：`frontend/src/App.vue`
+## 开发参考
 
-## 已知状态
+| 模块 | 入口文件 |
+|------|---------|
+| 后端 API | `backend/app/main.py` |
+| CLI | `backend/app/doc_asst/cli.py` |
+| 工作流 | `backend/app/doc_asst/orchestrator/graph.py` |
+| 前端 | `frontend/src/App.vue` |
 
-- API 与前端均已接入，可本地联调
-- Roadmap 与后续优化项见 `docs/roadmap.md`
+详见 `docs/architecture.md` 和 `docs/roadmap.md`。
