@@ -63,21 +63,65 @@ class ChatService:
         uploaded_files: Optional[List[str]] = None,
         memory: Optional[List[Dict[str, str]]] = None,
     ) -> Iterator[str]:
-        """流式执行工作流，逐步产出 NDJSON 事件行。"""
+        """流式执行工作流，逐步产出 NDJSON 事件行。
+
+        事件类型：
+        - token: LLM 逐字输出 {"type":"token", "thread_id":..., "node":..., "text":...}
+        - chunk: 节点完成状态 {"type":"chunk", "thread_id":..., "chunk":{node: data}}
+        - done:  流结束
+        - error: 错误
+        """
         tid = self.resolve_thread_id(thread_id)
 
+        # 将工作流迭代器的创建延迟到生成器内部，
+        # 确保 _build_runtime() 等初始化阶段的异常也能被捕获。
         try:
-            for chunk in run_workflow_stream(
+            stream_iter = run_workflow_stream(
                 user_input=message,
                 memory=memory,
                 thread_id=tid,
                 max_iterations=max_iterations,
                 uploaded_files=uploaded_files or None,
-            ):
-                yield json.dumps(
-                    {"type": "chunk", "thread_id": tid, "chunk": chunk},
-                    ensure_ascii=False,
-                ) + "\n"
+                stream_mode=["messages", "updates"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            yield json.dumps(
+                {"type": "error", "thread_id": tid, "detail": str(exc)},
+                ensure_ascii=False,
+            ) + "\n"
+            return
+
+        try:
+            for event in stream_iter:
+                stream_type = event.get("stream_type") if isinstance(event, dict) else None
+
+                if stream_type == "token":
+                    yield json.dumps(
+                        {
+                            "type": "token",
+                            "thread_id": tid,
+                            "node": event["node"],
+                            "text": event["text"],
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+
+                elif stream_type == "update":
+                    yield json.dumps(
+                        {
+                            "type": "chunk",
+                            "thread_id": tid,
+                            "chunk": {event["node"]: event["data"]},
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+
+                else:
+                    # 兜底：单 stream mode 的原始事件
+                    yield json.dumps(
+                        {"type": "chunk", "thread_id": tid, "chunk": event},
+                        ensure_ascii=False,
+                    ) + "\n"
 
             yield json.dumps(
                 {"type": "done", "thread_id": tid}, ensure_ascii=False

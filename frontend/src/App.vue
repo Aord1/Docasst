@@ -11,15 +11,31 @@ const loading = ref(false);
 const ingesting = ref(false);
 const pendingFiles = ref([]);
 const messagesContainer = ref(null);
-const streamMeta = ref({
-  inputTokens: 0,
-  outputTokens: 0,
-  totalTokens: 0,
-});
-
 const STORAGE_KEY = "docasst_web_sessions_v1";
 const sessions = ref([]);
 const currentSessionId = ref("");
+
+// ── 节点标签映射 ──────────────────────────────────────────
+const NODE_LABELS = {
+  simpleRouter: "路由判断",
+  planner: "规划",
+  extractor_summarizer: "研究",
+  reporter: "生成报告",
+  reflection: "反思",
+};
+const NODE_ORDER = ["planner", "extractor_summarizer", "reporter", "reflection"];
+
+function getNodeKeys(nodes) {
+  const keys = Object.keys(nodes);
+  return keys.sort((a, b) => {
+    const ai = NODE_ORDER.indexOf(a);
+    const bi = NODE_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return 0;
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+}
 
 function makeSession() {
   const localId = `local-${Date.now()}`;
@@ -121,16 +137,15 @@ async function sendMessage() {
   }
   chatInput.value = "";
   loading.value = true;
-  let cleanupTypewriter = null;
-  streamMeta.value = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
   try {
     if (pendingFiles.value.length > 0) {
       await uploadPendingFiles(session);
     }
-    const assistantMessage = { role: "assistant", content: "正在思考...\n" };
+    const assistantMessage = { role: "assistant", content: "", nodes: {} };
     session.messages.push(assistantMessage);
     await scrollToBottom();
+
     const res = await fetch(`${apiBase}/api/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -150,40 +165,8 @@ async function sendMessage() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
-    let latestFinal = "";
     const toolSet = new Set();
-    let isSimplePath = false;
-    const tokenUsage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
-    let targetRenderText = "正在思考...\n";
-    let revealIndex = 0;
-    let renderTimer = null;
-    let forcedReset = false;
-
-    const startTypewriter = () => {
-      if (renderTimer) return;
-      renderTimer = setInterval(() => {
-        if (forcedReset) {
-          assistantMessage.content = targetRenderText;
-          revealIndex = targetRenderText.length;
-          forcedReset = false;
-          return;
-        }
-        if (revealIndex >= targetRenderText.length) return;
-        revealIndex = Math.min(revealIndex + 3, targetRenderText.length);
-        assistantMessage.content = targetRenderText.slice(0, revealIndex);
-        void scrollToBottom(false);
-      }, 22);
-    };
-
-    const stopTypewriter = () => {
-      if (renderTimer) {
-        clearInterval(renderTimer);
-        renderTimer = null;
-      }
-    };
-    cleanupTypewriter = stopTypewriter;
-
-    startTypewriter();
+    let latestFinal = "";
 
     while (true) {
       const { done, value } = await reader.read();
@@ -197,18 +180,46 @@ async function sendMessage() {
         if (evt.thread_id) {
           session.threadId = evt.thread_id;
         }
+
+        // ── 逐字 token 事件 ─────────────────────────────
+        if (evt.type === "token") {
+          const node = evt.node;
+          if (!assistantMessage.nodes[node]) {
+            assistantMessage.nodes[node] = {
+              label: NODE_LABELS[node] || node,
+              text: "",
+              status: "streaming",
+            };
+          }
+          assistantMessage.nodes[node].text += evt.text;
+          void scrollToBottom(false);
+        }
+
+        // ── 节点完成 chunk 事件 ────────────────────────
         if (evt.type === "chunk" && evt.chunk && typeof evt.chunk === "object") {
-          for (const [, nodeState] of Object.entries(evt.chunk)) {
+          for (const [nodeKey, nodeState] of Object.entries(evt.chunk)) {
             if (!nodeState || typeof nodeState !== "object") continue;
+
+            // 如果没有 token 事件回退，用 chunk 数据创建节点
+            if (!assistantMessage.nodes[nodeKey]) {
+              const textKey = ["final_text", "plan_text", "summary_text", "reflection_text"].find(
+                (k) => nodeState[k]
+              );
+              if (textKey) {
+                assistantMessage.nodes[nodeKey] = {
+                  label: NODE_LABELS[nodeKey] || nodeKey,
+                  text: nodeState[textKey],
+                  status: "done",
+                };
+              }
+            } else {
+              assistantMessage.nodes[nodeKey].status = "done";
+            }
+
+            // 提取最终文本（用于 fallback content）
             if (nodeState.final_text) latestFinal = nodeState.final_text;
-            if (typeof nodeState.is_simple_query === "boolean") {
-              isSimplePath = nodeState.is_simple_query;
-            }
-            if (nodeState.token_usage && typeof nodeState.token_usage === "object") {
-              tokenUsage.input_tokens = Number(nodeState.token_usage.input_tokens || 0);
-              tokenUsage.output_tokens = Number(nodeState.token_usage.output_tokens || 0);
-              tokenUsage.total_tokens = Number(nodeState.token_usage.total_tokens || 0);
-            }
+
+            // 工具调用
             for (const key of ["planner_used_tools", "extractor_used_tools", "reporter_used_tools"]) {
               const arr = nodeState[key];
               if (Array.isArray(arr)) {
@@ -216,39 +227,24 @@ async function sendMessage() {
               }
             }
           }
-          const toolText = toolSet.size ? `\n\n工具调用：${Array.from(toolSet).join("、")}` : "\n\n工具调用：无";
-          const tokenText = `\nToken：输入 ${tokenUsage.input_tokens} / 输出 ${tokenUsage.output_tokens} / 总计 ${tokenUsage.total_tokens}`;
-          streamMeta.value = {
-            inputTokens: tokenUsage.input_tokens,
-            outputTokens: tokenUsage.output_tokens,
-            totalTokens: tokenUsage.total_tokens,
-          };
-          const nextTarget = (latestFinal || "正在思考...\n") + toolText + tokenText;
-          if (!nextTarget.startsWith(assistantMessage.content || "")) {
-            forcedReset = true;
-          }
-          targetRenderText = nextTarget;
         }
+
         if (evt.type === "error") {
-          stopTypewriter();
           throw new Error(evt.detail || "stream error");
         }
       }
     }
-    targetRenderText = (latestFinal || assistantMessage.content || "(空响应)").trim() || "(空响应)";
-    while ((assistantMessage.content || "") !== targetRenderText) {
-      await new Promise((resolve) => setTimeout(resolve, 16));
-    }
-    stopTypewriter();
+
+    // 最终组装 content（兼容旧消息格式）
+    const nodeTexts = Object.values(assistantMessage.nodes)
+      .map((n) => n.text)
+      .filter(Boolean);
+    assistantMessage.content = latestFinal || nodeTexts.join("\n\n") || "(空响应)";
     session.updatedAt = Date.now();
-    if (!assistantMessage.content.trim()) {
-      assistantMessage.content = "(空响应)";
-    }
   } catch (err) {
     session.messages.push({ role: "assistant", content: `请求失败: ${err.message}` });
     await scrollToBottom();
   } finally {
-    if (cleanupTypewriter) cleanupTypewriter();
     loading.value = false;
   }
 }
@@ -356,14 +352,29 @@ watch(currentMessages, async () => {
 
     <main class="content">
       <section v-if="activeNav === 'chat'" class="chat-panel">
-        <div class="stream-meta">
-          <span>Token：{{ streamMeta.inputTokens }} / {{ streamMeta.outputTokens }} / {{ streamMeta.totalTokens }}</span>
-        </div>
         <div ref="messagesContainer" class="messages">
           <div v-for="(item, idx) in currentMessages" :key="idx" class="msg" :class="item.role">
-            {{ item.content }}
+            <!-- 按节点分组显示流式输出 -->
+            <template v-if="item.nodes && Object.keys(item.nodes).length">
+              <div
+                v-for="nodeKey in getNodeKeys(item.nodes)"
+                :key="nodeKey"
+                class="node-section"
+                :class="item.nodes[nodeKey].status"
+              >
+                <div class="node-label">
+                  {{ item.nodes[nodeKey].label }}
+                  <span v-if="item.nodes[nodeKey].status === 'streaming'" class="node-indicator"></span>
+                </div>
+                <div class="node-text">{{ item.nodes[nodeKey].text }}</div>
+              </div>
+            </template>
+            <!-- 兼容无 nodes 的旧消息 -->
+            <template v-else>
+              {{ item.content }}
+            </template>
           </div>
-          <div v-if="loading" class="typing-wrap">
+          <div v-if="loading && !currentMessages.some(m => m.nodes && Object.keys(m.nodes).length)" class="typing-wrap">
             <div class="typing-bubble">
               <span></span><span></span><span></span>
             </div>
